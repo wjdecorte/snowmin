@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+# OS / Editor / Tools
+.DS_Store
+.vscode/
+.specstory/
