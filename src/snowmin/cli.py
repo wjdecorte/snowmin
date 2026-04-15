@@ -214,40 +214,41 @@ def tasks(ctx):
 
 
 @tasks.command("list")
-@click.option("--match", help="List tasks matching regex pattern")
+@click.option("--pattern", help="Filter tasks by regex pattern")
 @click.option("--schema", help="Schema to look for tasks in")
+@click.option("--status", help="Filter by status (started, suspended)")
 @click.pass_context
-def list_tasks(ctx, match, schema):
+def list_tasks(ctx, pattern, schema, status):
     """List tasks"""
     from snowmin.operations.tasks import list_tasks_command
 
-    list_tasks_command(ctx, match, schema)
+    list_tasks_command(ctx, pattern, schema, status)
 
 
 @tasks.command("suspend")
 @click.argument("task_name", required=False)
 @click.option("--all", is_flag=True, help="Suspend all tasks in schema")
-@click.option("--match", help="Suspend tasks matching regex pattern")
+@click.option("--pattern", help="Suspend tasks matching regex pattern")
 @click.option("--schema", help="Schema to look for tasks in")
 @click.pass_context
-def suspend_task(ctx, task_name, all, match, schema):
+def suspend_task(ctx, task_name, all, pattern, schema):
     """Suspend a task or multiple tasks"""
     from snowmin.operations.tasks import suspend_task_command
 
-    suspend_task_command(ctx, task_name, all, match, schema)
+    suspend_task_command(ctx, task_name, all, pattern, schema)
 
 
 @tasks.command("resume")
 @click.argument("task_name", required=False)
 @click.option("--all", is_flag=True, help="Resume all tasks in schema")
-@click.option("--match", help="Resume tasks matching regex pattern")
+@click.option("--pattern", help="Resume tasks matching regex pattern")
 @click.option("--schema", help="Schema to look for tasks in")
 @click.pass_context
-def resume_task(ctx, task_name, all, match, schema):
+def resume_task(ctx, task_name, all, pattern, schema):
     """Resume a task or multiple tasks"""
     from snowmin.operations.tasks import resume_task_command
 
-    resume_task_command(ctx, task_name, all, match, schema)
+    resume_task_command(ctx, task_name, all, pattern, schema)
 
 
 @cli.group()
@@ -265,6 +266,71 @@ def truncate_table(ctx, table_name):
     from snowmin.operations.tables import truncate_table_command
 
     truncate_table_command(ctx, table_name)
+
+
+@cli.group()
+@click.pass_context
+def streams(ctx):
+    """Manage Snowflake Streams"""
+    pass
+
+
+@streams.command("list")
+@click.option("--pattern", help="Filter streams by regex pattern")
+@click.option("--schema", help="Schema to query (DATABASE.SCHEMA or SCHEMA)")
+@click.pass_context
+def list_streams(ctx, pattern, schema):
+    """List streams"""
+    from snowmin.operations.streams import list_streams_command
+
+    list_streams_command(ctx, pattern, schema)
+
+
+@streams.command("create")
+@click.argument("stream_name")
+@click.argument("source_table")
+@click.option("--schema", help="Schema to create the stream in")
+@click.option(
+    "--mode",
+    type=click.Choice(["DEFAULT", "APPEND_ONLY", "INSERT_ONLY"], case_sensitive=False),
+    help="Stream mode",
+)
+@click.option(
+    "--before", help="Create stream BEFORE timestamp (e.g. '2024-01-01 00:00:00')"
+)
+@click.option("--at", help="Create stream AT timestamp (e.g. '2024-01-01 00:00:00')")
+@click.option("--comment", help="Description/comment for the stream")
+@click.pass_context
+def create_stream(ctx, stream_name, source_table, schema, mode, before, at, comment):
+    """Create a stream on a table"""
+    from snowmin.operations.streams import create_stream_command
+
+    create_stream_command(
+        ctx, stream_name, source_table, schema, mode, before, at, comment
+    )
+
+
+@streams.command("drop")
+@click.argument("stream_name")
+@click.option("--schema", help="Schema the stream belongs to")
+@click.pass_context
+def drop_stream(ctx, stream_name, schema):
+    """Drop a stream"""
+    from snowmin.operations.streams import drop_stream_command
+
+    drop_stream_command(ctx, stream_name, schema)
+
+
+@streams.command("reset")
+@click.argument("stream_name")
+@click.option("--schema", help="Schema the stream belongs to")
+@click.option("--at", help="Recreate stream AT timestamp (e.g. '2024-01-01 00:00:00')")
+@click.pass_context
+def reset_stream(ctx, stream_name, schema, at):
+    """Drop and recreate a stream, optionally at a point in time"""
+    from snowmin.operations.streams import reset_stream_command
+
+    reset_stream_command(ctx, stream_name, schema, at)
 
 
 @cli.group()

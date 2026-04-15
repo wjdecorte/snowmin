@@ -24,8 +24,9 @@ def _parse_schema_spec(schema_spec: Optional[str], config_database: Optional[str
 
 def list_tasks_command(
     ctx,
-    match: Optional[str] = None,
+    pattern: Optional[str] = None,
     schema: Optional[str] = None,
+    status: Optional[str] = None,
 ):
     """List tasks"""
     settings = ctx.obj["settings"]
@@ -82,17 +83,28 @@ def list_tasks_command(
             click.echo("No tasks found.")
             return
 
-        click.echo(f"\nFound {len(rows)} tasks:")
-        click.echo("-" * 60)
-
+        # Apply filters
+        filtered = []
         for row in rows:
             t_name = row[name_idx]
             t_state = row[state_idx] if state_idx is not None else "UNKNOWN"
             t_schema = row[schema_idx] if schema_idx is not None else "UNKNOWN"
 
-            if match and not re.search(match, t_name):
+            if pattern and not re.search(pattern, t_name):
+                continue
+            if status and t_state.lower() != status.lower():
                 continue
 
+            filtered.append((t_schema, t_name, t_state))
+
+        if not filtered:
+            click.echo("No tasks matched the given filters.")
+            return
+
+        click.echo(f"\nFound {len(filtered)} task(s):")
+        click.echo("-" * 60)
+
+        for t_schema, t_name, t_state in filtered:
             state_color = Fore.GREEN if t_state == "started" else Fore.YELLOW
             click.echo(f"{t_schema}.{t_name}: {state_color}{t_state}{Style.RESET_ALL}")
 
@@ -105,12 +117,12 @@ def _process_tasks(
     action: str,
     task_name: Optional[str],
     all_flag: bool,
-    match: Optional[str],
+    pattern: Optional[str],
     schema: Optional[str],
 ):
     """Helper to process task actions"""
-    if not task_name and not all_flag and not match:
-        raise click.UsageError("Must provide TASK_NAME, --all, or --match")
+    if not task_name and not all_flag and not pattern:
+        raise click.UsageError("Must provide TASK_NAME, --all, or --pattern")
 
     settings = ctx.obj["settings"]
     cli_overrides = ctx.obj["cli_overrides"]
@@ -130,7 +142,7 @@ def _process_tasks(
 
         if task_name:
             tasks_to_process.append(task_name)
-        elif all_flag or match:
+        elif all_flag or pattern:
             query = "SHOW TASKS"
             if target_schema:
                 if target_database:
@@ -173,8 +185,8 @@ def _process_tasks(
                 t_database = row[database_idx] if database_idx is not None else None
                 t_schema = row[schema_idx] if schema_idx is not None else None
 
-                if match:
-                    if re.search(match, t_name):
+                if pattern:
+                    if re.search(pattern, t_name):
                         tasks_to_process.append((t_name, t_state, t_database, t_schema))
                 else:
                     tasks_to_process.append((t_name, t_state, t_database, t_schema))
@@ -184,7 +196,7 @@ def _process_tasks(
             return
 
         # Display tasks before confirmation
-        if all_flag or match:
+        if all_flag or pattern:
             click.echo(f"\nFound {len(tasks_to_process)} task(s) to {action}:")
             for task_info in tasks_to_process:
                 t_name = task_info[0] if isinstance(task_info, tuple) else task_info
@@ -249,19 +261,19 @@ def suspend_task_command(
     ctx,
     task_name: Optional[str],
     all: bool,
-    match: Optional[str],
+    pattern: Optional[str],
     schema: Optional[str],
 ):
     """Suspend a task or multiple tasks"""
-    _process_tasks(ctx, "SUSPEND", task_name, all, match, schema)
+    _process_tasks(ctx, "SUSPEND", task_name, all, pattern, schema)
 
 
 def resume_task_command(
     ctx,
     task_name: Optional[str],
     all: bool,
-    match: Optional[str],
+    pattern: Optional[str],
     schema: Optional[str],
 ):
     """Resume a task or multiple tasks"""
-    _process_tasks(ctx, "RESUME", task_name, all, match, schema)
+    _process_tasks(ctx, "RESUME", task_name, all, pattern, schema)
