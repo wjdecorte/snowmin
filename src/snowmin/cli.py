@@ -278,12 +278,17 @@ def streams(ctx):
 @streams.command("list")
 @click.option("--pattern", help="Filter streams by regex pattern")
 @click.option("--schema", help="Schema to query (DATABASE.SCHEMA or SCHEMA)")
+@click.option(
+    "--has-data/--no-data",
+    default=None,
+    help="Filter by data availability",
+)
 @click.pass_context
-def list_streams(ctx, pattern, schema):
+def list_streams(ctx, pattern, schema, has_data):
     """List streams"""
     from snowmin.operations.streams import list_streams_command
 
-    list_streams_command(ctx, pattern, schema)
+    list_streams_command(ctx, pattern, schema, has_data)
 
 
 @streams.command("create")

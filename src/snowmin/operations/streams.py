@@ -133,6 +133,7 @@ def list_streams_command(
     ctx,
     pattern: Optional[str] = None,
     schema: Optional[str] = None,
+    has_data: Optional[bool] = None,
 ):
     """List streams"""
     settings = ctx.obj["settings"]
@@ -183,7 +184,7 @@ def list_streams_command(
             click.echo("No streams found.")
             return
 
-        # Apply filters
+        # Apply basic filters first
         filtered = []
         for row in rows:
             s_name = row[name_idx]
@@ -206,6 +207,21 @@ def list_streams_command(
         click.echo(f"Checking data status for {len(filtered)} stream(s)...")
         has_data_map = _fetch_stream_has_data(conn_config, filtered)
 
+        # Apply secondary filter for has_data if specified
+        final_filtered = []
+        if has_data is not None:
+            for stream in filtered:
+                s_name = stream[1]
+                stream_has_data = has_data_map.get(s_name)
+                # Only include streams where we successfully got a boolean, and it matches the filter
+                if stream_has_data is has_data:
+                    final_filtered.append(stream)
+            filtered = final_filtered
+
+            if not filtered:
+                click.echo("No streams matched the has-data filter.")
+                return
+
         click.echo(f"\nFound {len(filtered)} stream(s):")
         click.echo("-" * 90)
 
@@ -213,11 +229,11 @@ def list_streams_command(
             mode_color = _get_mode_color(s_mode)
             stale_color = Fore.RED if str(s_stale).lower() == "true" else Fore.GREEN
             stale_label = "STALE" if str(s_stale).lower() == "true" else "OK"
-            has_data = has_data_map.get(s_name)
-            if has_data is True:
+            stream_has_data = has_data_map.get(s_name)
+            if stream_has_data is True:
                 data_color = Fore.GREEN
                 data_label = "HAS DATA"
-            elif has_data is False:
+            elif stream_has_data is False:
                 data_color = Fore.YELLOW
                 data_label = "EMPTY"
             else:
@@ -293,6 +309,12 @@ def create_stream_command(
                     f"Unknown stream mode: {mode}. Use DEFAULT, APPEND_ONLY, or INSERT_ONLY."
                 )
 
+        # Add point-in-time clause
+        if at:
+            query += f" AT (TIMESTAMP => '{at}'::TIMESTAMP_LTZ)"
+        elif before:
+            query += f" BEFORE (TIMESTAMP => '{before}'::TIMESTAMP_LTZ)"
+
         # Add comment (use default if none provided)
         if not comment and target_schema and source_table:
             # Extract bare table name (strip any db.schema prefix)
@@ -303,12 +325,6 @@ def create_stream_command(
         if comment:
             escaped = comment.replace("'", "''")
             query += f" COMMENT = '{escaped}'"
-
-        # Add point-in-time clause
-        if at:
-            query += f" AT (TIMESTAMP => '{at}'::TIMESTAMP_LTZ)"
-        elif before:
-            query += f" BEFORE (TIMESTAMP => '{before}'::TIMESTAMP_LTZ)"
 
         # Switch to owner role before creating
         if target_database and target_schema:
