@@ -393,15 +393,21 @@ def drop_stream_command(
 
 def reset_stream_command(
     ctx,
-    stream_name: str,
+    stream_name: Optional[str],
+    all_flag: bool = False,
     schema: Optional[str] = None,
     at: Optional[str] = None,
 ):
-    """Reset a stream by dropping and recreating it, optionally at a point in time.
+    """Reset one or more streams by dropping and recreating them.
 
     Fetches the stream's DDL via GET_DDL, drops it, then recreates it.
-    If --at is provided, appends AT (TIMESTAMP => ...) to the CREATE statement.
+    If --at is provided, inserts AT (TIMESTAMP => ...) into the CREATE statement.
     """
+    if not stream_name and not all_flag:
+        raise click.UsageError("Must provide STREAM_NAME or --all")
+    if stream_name and all_flag:
+        raise click.UsageError("Provide either STREAM_NAME or --all, not both")
+
     settings = ctx.obj["settings"]
     cli_overrides = ctx.obj["cli_overrides"]
     conn_config = get_merged_connection_config(settings, cli_overrides)
@@ -416,58 +422,74 @@ def reset_stream_command(
             target_schema_spec, config_database
         )
 
-        # Build fully qualified stream name
-        if target_database and target_schema:
-            full_stream_name = f"{target_database}.{target_schema}.{stream_name}"
-        elif target_schema:
-            full_stream_name = f"{target_schema}.{stream_name}"
+        streams_to_process = []
+
+        if stream_name:
+            streams_to_process.append((stream_name, target_database, target_schema))
         else:
-            full_stream_name = stream_name
-
-        # 1. Fetch DDL
-        click.echo(f"Fetching DDL for stream {full_stream_name}...")
-        ddl_query = f"SELECT GET_DDL('stream', '{full_stream_name}')"
-        cursor = ConnectionManager.execute(ddl_query, conn_config=conn_config)
-        res = cursor.fetchone()
-        cursor.close()
-
-        if not res or not res[0]:
-            raise click.ClickException(
-                f"Could not fetch DDL for stream {full_stream_name}"
+            query = "SHOW STREAMS" + _build_schema_query_suffix(
+                target_database, target_schema
             )
-        ddl = res[0].strip().rstrip(";")
-
-        click.echo(f"Current DDL:\n{Fore.CYAN}{ddl}{Style.RESET_ALL}\n")
-
-        # 2. Extract existing comment before dropping
-        existing_comment = None
-        show_query = f"SHOW STREAMS LIKE '{stream_name}'"
-        show_query += _build_schema_query_suffix(target_database, target_schema)
-        cursor = ConnectionManager.execute(show_query, conn_config=conn_config)
-        col_map = {c[0].upper(): i for i, c in enumerate(cursor.description)}
-        comment_idx = col_map.get("COMMENT")
-        show_rows = cursor.fetchall()
-        cursor.close()
-
-        if show_rows and comment_idx is not None:
-            existing_comment = show_rows[0][comment_idx]
-            if existing_comment:
-                click.echo(
-                    f"Preserving comment: {Fore.YELLOW}{existing_comment}{Style.RESET_ALL}"
-                )
-
-        # If point-in-time requested, append AT clause to DDL
-        if at:
-            ddl += f" AT (TIMESTAMP => '{at}'::TIMESTAMP_LTZ)"
             click.echo(
-                f"Will recreate with point-in-time: {Fore.YELLOW}{at}{Style.RESET_ALL}"
+                f"Fetching streams{_location_label(target_database, target_schema)}..."
             )
+            cursor = ConnectionManager.execute(query, conn_config=conn_config)
+            col_map = {c[0].upper(): i for i, c in enumerate(cursor.description)}
+            name_idx = col_map.get("NAME")
+            database_idx = col_map.get("DATABASE_NAME")
+            schema_idx = col_map.get("SCHEMA_NAME")
 
-        if not click.confirm(
-            f"Are you sure you want to reset stream '{full_stream_name}'?"
-        ):
-            click.echo("Operation cancelled.")
+            if name_idx is None:
+                click.echo(
+                    f"{Fore.RED}Error: Could not find 'name' column in SHOW STREAMS result.{Style.RESET_ALL}",
+                    err=True,
+                )
+                cursor.close()
+                return
+
+            rows = cursor.fetchall()
+            cursor.close()
+
+            for row in rows:
+                s_name = row[name_idx]
+                s_database = row[database_idx] if database_idx is not None else None
+                s_schema = row[schema_idx] if schema_idx is not None else None
+                streams_to_process.append((s_name, s_database, s_schema))
+
+        if not streams_to_process:
+            click.echo("No streams found to reset.")
             return
+
+        if all_flag:
+            click.echo(f"\nFound {len(streams_to_process)} stream(s) to reset:")
+            for s_name, s_database, s_schema in streams_to_process:
+                if s_database and s_schema:
+                    display_name = f"{s_database}.{s_schema}.{s_name}"
+                elif s_schema:
+                    display_name = f"{s_schema}.{s_name}"
+                else:
+                    display_name = s_name
+                click.echo(f"  - {Fore.CYAN}{display_name}{Style.RESET_ALL}")
+
+            if not click.confirm(
+                f"\nAre you sure you want to reset {len(streams_to_process)} stream(s)?"
+            ):
+                click.echo("Operation cancelled.")
+                return
+        else:
+            s_name, s_database, s_schema = streams_to_process[0]
+            if s_database and s_schema:
+                full_stream_name = f"{s_database}.{s_schema}.{s_name}"
+            elif s_schema:
+                full_stream_name = f"{s_schema}.{s_name}"
+            else:
+                full_stream_name = s_name
+
+            if not click.confirm(
+                f"Are you sure you want to reset stream '{full_stream_name}'?"
+            ):
+                click.echo("Operation cancelled.")
+                return
 
         # Switch to owner role before drop/recreate
         if target_database and target_schema:
@@ -477,34 +499,115 @@ def reset_stream_command(
             cursor = ConnectionManager.execute(use_role_query, conn_config=conn_config)
             cursor.close()
 
-        # 3. Drop stream
-        drop_query = f"DROP STREAM {full_stream_name}"
-        click.echo(f"Executing: {drop_query}")
-        cursor = ConnectionManager.execute(drop_query, conn_config=conn_config)
-        cursor.close()
+        for s_name, s_database, s_schema in streams_to_process:
+            try:
+                stream_database = s_database or target_database
+                stream_schema = s_schema or target_schema
 
-        # 4. Recreate stream (set schema context so DDL resolves correctly)
-        if target_database and target_schema:
-            use_query = f"USE SCHEMA {target_database}.{target_schema}"
-            click.echo(f"Setting context: {use_query}")
-            cursor = ConnectionManager.execute(use_query, conn_config=conn_config)
-            cursor.close()
+                if stream_database and stream_schema:
+                    full_stream_name = f"{stream_database}.{stream_schema}.{s_name}"
+                elif stream_schema:
+                    full_stream_name = f"{stream_schema}.{s_name}"
+                else:
+                    full_stream_name = s_name
 
-        click.echo(f"Recreating stream {stream_name}...")
-        cursor = ConnectionManager.execute(ddl, conn_config=conn_config)
-        cursor.close()
-        click.echo(
-            f"{Fore.GREEN}Successfully reset stream: {full_stream_name}{Style.RESET_ALL}"
-        )
+                # 1. Fetch DDL
+                click.echo(f"Fetching DDL for stream {full_stream_name}...")
+                ddl_query = f"SELECT GET_DDL('stream', '{full_stream_name}')"
+                cursor = ConnectionManager.execute(ddl_query, conn_config=conn_config)
+                res = cursor.fetchone()
+                cursor.close()
 
-        # 5. Restore existing comment if present
-        if existing_comment:
-            escaped = existing_comment.replace("'", "''")
-            comment_query = f"ALTER STREAM {full_stream_name} SET COMMENT = '{escaped}'"
-            click.echo(f"Executing: {comment_query}")
-            cursor = ConnectionManager.execute(comment_query, conn_config=conn_config)
-            cursor.close()
-            click.echo(f"{Fore.GREEN}Restored comment on stream{Style.RESET_ALL}")
+                if not res or not res[0]:
+                    raise click.ClickException(
+                        f"Could not fetch DDL for stream {full_stream_name}"
+                    )
+                ddl = res[0].strip().rstrip(";")
+
+                click.echo(f"Current DDL:\n{Fore.CYAN}{ddl}{Style.RESET_ALL}\n")
+
+                # 2. Extract existing comment before dropping
+                existing_comment = None
+                show_query = f"SHOW STREAMS LIKE '{s_name}'"
+                show_query += _build_schema_query_suffix(stream_database, stream_schema)
+                cursor = ConnectionManager.execute(show_query, conn_config=conn_config)
+                col_map = {c[0].upper(): i for i, c in enumerate(cursor.description)}
+                comment_idx = col_map.get("COMMENT")
+                show_rows = cursor.fetchall()
+                cursor.close()
+
+                if show_rows and comment_idx is not None:
+                    existing_comment = show_rows[0][comment_idx]
+                    if existing_comment:
+                        click.echo(
+                            f"Preserving comment: {Fore.YELLOW}{existing_comment}{Style.RESET_ALL}"
+                        )
+
+                # If point-in-time requested, insert AT clause after source object.
+                if at:
+                    match = re.search(
+                        r'(?i)(ON\s+(?:TABLE|VIEW|STAGE)\s+(?:"[^"]*"|[^\s]+))',
+                        ddl,
+                    )
+                    if match:
+                        insertion_point = match.end()
+                        ddl = (
+                            f"{ddl[:insertion_point]} "
+                            f"AT (TIMESTAMP => '{at}'::TIMESTAMP_LTZ) "
+                            f"{ddl[insertion_point:]}"
+                        )
+                    else:
+                        ddl += f" AT (TIMESTAMP => '{at}'::TIMESTAMP_LTZ)"
+
+                    click.echo(
+                        f"Will recreate with point-in-time: {Fore.YELLOW}{at}{Style.RESET_ALL}"
+                    )
+
+                # 3. Drop stream
+                drop_query = f"DROP STREAM {full_stream_name}"
+                click.echo(f"Executing: {drop_query}")
+                cursor = ConnectionManager.execute(drop_query, conn_config=conn_config)
+                cursor.close()
+
+                # 4. Recreate stream (set schema context so DDL resolves correctly)
+                if stream_database and stream_schema:
+                    use_query = f"USE SCHEMA {stream_database}.{stream_schema}"
+                    click.echo(f"Setting context: {use_query}")
+                    cursor = ConnectionManager.execute(
+                        use_query, conn_config=conn_config
+                    )
+                    cursor.close()
+
+                click.echo(f"Recreating stream {s_name}...")
+                cursor = ConnectionManager.execute(ddl, conn_config=conn_config)
+                cursor.close()
+                click.echo(
+                    f"{Fore.GREEN}Successfully reset stream: {full_stream_name}{Style.RESET_ALL}"
+                )
+
+                # 5. Restore existing comment if present
+                if existing_comment:
+                    escaped = existing_comment.replace("'", "''")
+                    comment_query = (
+                        f"ALTER STREAM {full_stream_name} SET COMMENT = '{escaped}'"
+                    )
+                    click.echo(f"Executing: {comment_query}")
+                    cursor = ConnectionManager.execute(
+                        comment_query, conn_config=conn_config
+                    )
+                    cursor.close()
+                    click.echo(
+                        f"{Fore.GREEN}Restored comment on stream{Style.RESET_ALL}"
+                    )
+
+            except Exception as e:
+                click.echo(
+                    f"{Fore.RED}Error processing stream {s_name}: {e}{Style.RESET_ALL}",
+                    err=True,
+                )
+                raise click.ClickException(
+                    f"Aborting due to error on stream {s_name}: {e}"
+                )
 
     except Exception as e:
         click.echo(f"{Fore.RED}Error: {e}{Style.RESET_ALL}", err=True)

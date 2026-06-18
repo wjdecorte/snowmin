@@ -327,15 +327,16 @@ def drop_stream(ctx, stream_name, schema):
 
 
 @streams.command("reset")
-@click.argument("stream_name")
+@click.argument("stream_name", required=False)
+@click.option("--all", "all_streams", is_flag=True, help="Reset all streams in schema")
 @click.option("--schema", help="Schema the stream belongs to")
 @click.option("--at", help="Recreate stream AT timestamp (e.g. '2024-01-01 00:00:00')")
 @click.pass_context
-def reset_stream(ctx, stream_name, schema, at):
-    """Drop and recreate a stream, optionally at a point in time"""
+def reset_stream(ctx, stream_name, all_streams, schema, at):
+    """Drop and recreate one or more streams, optionally at a point in time"""
     from snowmin.operations.streams import reset_stream_command
 
-    reset_stream_command(ctx, stream_name, schema, at)
+    reset_stream_command(ctx, stream_name, all_streams, schema, at)
 
 
 @cli.group()
