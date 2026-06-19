@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from snowmin.operations.tasks import resume_task_command, suspend_task_command
+from snowmin.operations.tasks import (
+    list_tasks_command,
+    resume_task_command,
+    suspend_task_command,
+)
 
 
 class FakeCursor:
@@ -101,6 +105,67 @@ def test_resume_pattern_only_processes_suspended_tasks(mocker):
     executed_sql = [call.args[0] for call in execute.call_args_list]
     assert "ALTER TASK RAP_DEV_ANALYTICS.MART.LOAD_CUSTOMERS RESUME" not in executed_sql
     assert "ALTER TASK RAP_DEV_ANALYTICS.MART.LOAD_ORDERS RESUME" in executed_sql
+
+
+def test_list_tasks_queries_comma_separated_schemas(mocker):
+    _patch_config(mocker)
+    execute = mocker.patch("snowmin.operations.tasks.ConnectionManager.execute")
+
+    def execute_side_effect(query, conn_config):
+        if query == "SHOW TASKS IN SCHEMA RAP_DEV_ANALYTICS.SILVER":
+            return FakeCursor(
+                description=TASK_DESCRIPTION,
+                rows=[("LOAD_CUSTOMERS", "started", "RAP_DEV_ANALYTICS", "SILVER")],
+            )
+        if query == "SHOW TASKS IN SCHEMA RAP_DEV_ANALYTICS.GOLD":
+            return FakeCursor(
+                description=TASK_DESCRIPTION,
+                rows=[("LOAD_ORDERS", "suspended", "RAP_DEV_ANALYTICS", "GOLD")],
+            )
+        return FakeCursor()
+
+    execute.side_effect = execute_side_effect
+
+    list_tasks_command(_ctx(mocker), schema="SILVER,GOLD")
+
+    executed_sql = [call.args[0] for call in execute.call_args_list]
+    assert executed_sql == [
+        "SHOW TASKS IN SCHEMA RAP_DEV_ANALYTICS.SILVER",
+        "SHOW TASKS IN SCHEMA RAP_DEV_ANALYTICS.GOLD",
+    ]
+
+
+def test_suspend_all_queries_comma_separated_schemas(mocker):
+    _patch_config(mocker)
+    mocker.patch("snowmin.operations.tasks.click.confirm", return_value=True)
+    execute = mocker.patch("snowmin.operations.tasks.ConnectionManager.execute")
+
+    def execute_side_effect(query, conn_config):
+        if query == "SHOW TASKS IN SCHEMA RAP_DEV_ANALYTICS.SILVER":
+            return FakeCursor(
+                description=TASK_DESCRIPTION,
+                rows=[("LOAD_CUSTOMERS", "started", "RAP_DEV_ANALYTICS", "SILVER")],
+            )
+        if query == "SHOW TASKS IN SCHEMA RAP_DEV_ANALYTICS.GOLD":
+            return FakeCursor(
+                description=TASK_DESCRIPTION,
+                rows=[("LOAD_ORDERS", "started", "RAP_DEV_ANALYTICS", "GOLD")],
+            )
+        return FakeCursor()
+
+    execute.side_effect = execute_side_effect
+
+    suspend_task_command(
+        _ctx(mocker),
+        task_name=None,
+        all=True,
+        pattern=None,
+        schema="SILVER,GOLD",
+    )
+
+    executed_sql = [call.args[0] for call in execute.call_args_list]
+    assert "ALTER TASK RAP_DEV_ANALYTICS.SILVER.LOAD_CUSTOMERS SUSPEND" in executed_sql
+    assert "ALTER TASK RAP_DEV_ANALYTICS.GOLD.LOAD_ORDERS SUSPEND" in executed_sql
 
 
 def test_single_suspend_skips_task_that_is_not_started(mocker):

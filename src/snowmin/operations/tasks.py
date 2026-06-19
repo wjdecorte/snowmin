@@ -7,44 +7,11 @@ from typing import Any, Optional
 from colorama import Fore, Style
 from snowmin.core.connection import ConnectionManager
 from snowmin.core.config import get_merged_connection_config
-
-
-def _parse_schema_spec(schema_spec: Optional[str], config_database: Optional[str]):
-    """Parse schema specification which can be 'schema' or 'database.schema'.
-    Returns (database, schema) tuple.
-    """
-    if not schema_spec:
-        return config_database, None
-
-    if "." in schema_spec:
-        parts = schema_spec.split(".", 1)
-        return parts[0], parts[1]
-    else:
-        return config_database, schema_spec
-
-
-def _build_schema_query_suffix(target_database, target_schema):
-    """Build the IN SCHEMA / IN DATABASE suffix for SHOW queries."""
-    if target_schema:
-        if target_database:
-            return f" IN SCHEMA {target_database}.{target_schema}"
-        else:
-            raise click.ClickException(
-                f"Cannot query schema '{target_schema}' without a database. "
-                f"Either set 'database' in your connection config or use --schema DATABASE.SCHEMA format."
-            )
-    elif target_database:
-        return f" IN DATABASE {target_database}"
-    return ""
-
-
-def _location_label(target_database, target_schema):
-    """Build a human-readable location label for echo messages."""
-    if target_schema:
-        return f" from {target_database}.{target_schema}"
-    elif target_database:
-        return f" from database {target_database}"
-    return ""
+from snowmin.operations.schema import (
+    build_schema_query_suffix,
+    location_label,
+    parse_schema_specs,
+)
 
 
 def _desired_state_for_action(action: str) -> str:
@@ -410,57 +377,51 @@ def list_tasks_command(
         )
         config_database = conn_config.get("database")
 
-        target_database, target_schema = _parse_schema_spec(
-            target_schema_spec, config_database
-        )
-
-        query = "SHOW TASKS" + _build_schema_query_suffix(
-            target_database, target_schema
-        )
-
-        click.echo(
-            f"Fetching tasks{_location_label(target_database, target_schema)}..."
-        )
-
-        cursor = ConnectionManager.execute(query, conn_config=conn_config)
-
-        # Helper to find column index case-insensitively
-        col_map = {c[0].upper(): i for i, c in enumerate(cursor.description)}
-        name_idx = col_map.get("NAME")
-        state_idx = col_map.get("STATE")
-        schema_idx = col_map.get("SCHEMA_NAME")
-
-        if name_idx is None:
-            click.echo(
-                f"{Fore.RED}Error: Could not find 'name' column in SHOW TASKS result.{Style.RESET_ALL}",
-                err=True,
-            )
-            cursor.close()
-            return
-
-        rows = cursor.fetchall()
-        cursor.close()
-
-        if not rows:
-            click.echo("No tasks found.")
-            return
-
-        # Apply filters
         filtered = []
-        for row in rows:
-            t_name = row[name_idx]
-            t_state = row[state_idx] if state_idx is not None else "UNKNOWN"
-            t_schema = row[schema_idx] if schema_idx is not None else "UNKNOWN"
+        for target_database, target_schema in parse_schema_specs(
+            target_schema_spec, config_database
+        ):
+            query = "SHOW TASKS" + build_schema_query_suffix(
+                target_database, target_schema
+            )
 
-            if pattern and not re.search(pattern, t_name):
-                continue
-            if status and t_state.lower() != status.lower():
-                continue
+            click.echo(
+                f"Fetching tasks{location_label(target_database, target_schema)}..."
+            )
 
-            filtered.append((t_schema, t_name, t_state))
+            cursor = ConnectionManager.execute(query, conn_config=conn_config)
+
+            # Helper to find column index case-insensitively
+            col_map = {c[0].upper(): i for i, c in enumerate(cursor.description)}
+            name_idx = col_map.get("NAME")
+            state_idx = col_map.get("STATE")
+            schema_idx = col_map.get("SCHEMA_NAME")
+
+            if name_idx is None:
+                click.echo(
+                    f"{Fore.RED}Error: Could not find 'name' column in SHOW TASKS result.{Style.RESET_ALL}",
+                    err=True,
+                )
+                cursor.close()
+                return
+
+            rows = cursor.fetchall()
+            cursor.close()
+
+            for row in rows:
+                t_name = row[name_idx]
+                t_state = row[state_idx] if state_idx is not None else "UNKNOWN"
+                t_schema = row[schema_idx] if schema_idx is not None else "UNKNOWN"
+
+                if pattern and not re.search(pattern, t_name):
+                    continue
+                if status and t_state.lower() != status.lower():
+                    continue
+
+                filtered.append((t_schema, t_name, t_state))
 
         if not filtered:
-            click.echo("No tasks matched the given filters.")
+            click.echo("No tasks found.")
             return
 
         click.echo(f"\nFound {len(filtered)} task(s):")
@@ -496,9 +457,7 @@ def _process_tasks(
         )
         config_database = conn_config.get("database")
 
-        target_database, target_schema = _parse_schema_spec(
-            target_schema_spec, config_database
-        )
+        target_locations = parse_schema_specs(target_schema_spec, config_database)
 
         tasks_to_process = []
         discovered_tasks = []
@@ -507,108 +466,41 @@ def _process_tasks(
 
         if task_name:
             lookup_name = task_name
-            lookup_database = target_database
-            lookup_schema = target_schema
+            lookup_locations = target_locations
             if "." in lookup_name:
                 parts = lookup_name.split(".")
                 if len(parts) == 3:
                     lookup_database, lookup_schema, lookup_name = parts
+                    lookup_locations = [(lookup_database, lookup_schema)]
                 elif len(parts) == 2:
                     lookup_schema, lookup_name = parts
+                    lookup_locations = [(config_database, lookup_schema)]
 
-            query = f"SHOW TASKS LIKE '{lookup_name}'" + _build_schema_query_suffix(
-                lookup_database, lookup_schema
-            )
-            cursor = ConnectionManager.execute(query, conn_config=conn_config)
-            col_map = {c[0].upper(): i for i, c in enumerate(cursor.description)}
-            name_idx = col_map.get("NAME")
-            state_idx = col_map.get("STATE")
-            database_idx = col_map.get("DATABASE_NAME")
-            schema_idx = col_map.get("SCHEMA_NAME")
-            predecessors_idx = col_map.get("PREDECESSORS")
-            task_relations_idx = col_map.get("TASK_RELATIONS")
-            rows = cursor.fetchall()
-            cursor.close()
-
-            if name_idx is None:
-                click.echo(
-                    f"{Fore.RED}Error: Could not find 'name' column in SHOW TASKS result.{Style.RESET_ALL}",
-                    err=True,
+            for lookup_database, lookup_schema in lookup_locations:
+                query = f"SHOW TASKS LIKE '{lookup_name}'" + build_schema_query_suffix(
+                    lookup_database, lookup_schema
                 )
-                return
-            if not rows:
-                click.echo(f"No task found matching {task_name}.")
-                return
-
-            row = rows[0]
-            task_info = _build_task_info(
-                row,
-                name_idx,
-                state_idx,
-                database_idx,
-                schema_idx,
-                predecessors_idx,
-                task_relations_idx,
-                lookup_database,
-                lookup_schema,
-            )
-            discovered_tasks.append(task_info)
-            t_state = task_info["state"]
-
-            if str(t_state).lower() != desired_state:
-                click.echo(
-                    f"Task {task_name} is {t_state}, skipping "
-                    f"(only {desired_state} tasks are {_action_past_tense(action)})."
-                )
-                return
-
-            tasks_to_process.append(task_info)
-            if (
-                action in {"RESUME", "SUSPEND"}
-                and (predecessors_idx is not None or task_relations_idx is not None)
-                and task_info["database"]
-                and task_info["schema"]
-            ):
-                graph_query = "SHOW TASKS" + _build_schema_query_suffix(
-                    task_info["database"], task_info["schema"]
-                )
-                discovered_tasks = _load_discovered_tasks(
-                    graph_query,
-                    conn_config,
-                    task_info["database"],
-                    task_info["schema"],
-                )
-        elif all_flag or pattern:
-            query = "SHOW TASKS" + _build_schema_query_suffix(
-                target_database, target_schema
-            )
-
-            click.echo(
-                f"Fetching tasks{_location_label(target_database, target_schema)}..."
-            )
-            cursor = ConnectionManager.execute(query, conn_config=conn_config)
-
-            # Helper to find column index case-insensitively
-            col_map = {c[0].upper(): i for i, c in enumerate(cursor.description)}
-            name_idx = col_map.get("NAME")
-            state_idx = col_map.get("STATE")
-            database_idx = col_map.get("DATABASE_NAME")
-            schema_idx = col_map.get("SCHEMA_NAME")
-            predecessors_idx = col_map.get("PREDECESSORS")
-            task_relations_idx = col_map.get("TASK_RELATIONS")
-
-            if name_idx is None:
-                click.echo(
-                    f"{Fore.RED}Error: Could not find 'name' column in SHOW TASKS result.{Style.RESET_ALL}",
-                    err=True,
-                )
+                cursor = ConnectionManager.execute(query, conn_config=conn_config)
+                col_map = {c[0].upper(): i for i, c in enumerate(cursor.description)}
+                name_idx = col_map.get("NAME")
+                state_idx = col_map.get("STATE")
+                database_idx = col_map.get("DATABASE_NAME")
+                schema_idx = col_map.get("SCHEMA_NAME")
+                predecessors_idx = col_map.get("PREDECESSORS")
+                task_relations_idx = col_map.get("TASK_RELATIONS")
+                rows = cursor.fetchall()
                 cursor.close()
-                return
 
-            rows = cursor.fetchall()
-            cursor.close()
+                if name_idx is None:
+                    click.echo(
+                        f"{Fore.RED}Error: Could not find 'name' column in SHOW TASKS result.{Style.RESET_ALL}",
+                        err=True,
+                    )
+                    return
+                if not rows:
+                    continue
 
-            for row in rows:
+                row = rows[0]
                 task_info = _build_task_info(
                     row,
                     name_idx,
@@ -617,20 +509,94 @@ def _process_tasks(
                     schema_idx,
                     predecessors_idx,
                     task_relations_idx,
-                    target_database,
-                    target_schema,
+                    lookup_database,
+                    lookup_schema,
                 )
                 discovered_tasks.append(task_info)
-                t_name = task_info["name"]
                 t_state = task_info["state"]
 
-                if pattern:
-                    if re.search(pattern, t_name):
+                if str(t_state).lower() != desired_state:
+                    click.echo(
+                        f"Task {task_info['full_name']} is {t_state}, skipping "
+                        f"(only {desired_state} tasks are {_action_past_tense(action)})."
+                    )
+                    continue
+
+                tasks_to_process.append(task_info)
+                if (
+                    action in {"RESUME", "SUSPEND"}
+                    and (predecessors_idx is not None or task_relations_idx is not None)
+                    and task_info["database"]
+                    and task_info["schema"]
+                ):
+                    graph_query = "SHOW TASKS" + build_schema_query_suffix(
+                        task_info["database"], task_info["schema"]
+                    )
+                    discovered_tasks.extend(
+                        _load_discovered_tasks(
+                            graph_query,
+                            conn_config,
+                            task_info["database"],
+                            task_info["schema"],
+                        )
+                    )
+            if not tasks_to_process:
+                click.echo(f"No task found matching {task_name}.")
+                return
+        elif all_flag or pattern:
+            for target_database, target_schema in target_locations:
+                query = "SHOW TASKS" + build_schema_query_suffix(
+                    target_database, target_schema
+                )
+
+                click.echo(
+                    f"Fetching tasks{location_label(target_database, target_schema)}..."
+                )
+                cursor = ConnectionManager.execute(query, conn_config=conn_config)
+
+                # Helper to find column index case-insensitively
+                col_map = {c[0].upper(): i for i, c in enumerate(cursor.description)}
+                name_idx = col_map.get("NAME")
+                state_idx = col_map.get("STATE")
+                database_idx = col_map.get("DATABASE_NAME")
+                schema_idx = col_map.get("SCHEMA_NAME")
+                predecessors_idx = col_map.get("PREDECESSORS")
+                task_relations_idx = col_map.get("TASK_RELATIONS")
+
+                if name_idx is None:
+                    click.echo(
+                        f"{Fore.RED}Error: Could not find 'name' column in SHOW TASKS result.{Style.RESET_ALL}",
+                        err=True,
+                    )
+                    cursor.close()
+                    return
+
+                rows = cursor.fetchall()
+                cursor.close()
+
+                for row in rows:
+                    task_info = _build_task_info(
+                        row,
+                        name_idx,
+                        state_idx,
+                        database_idx,
+                        schema_idx,
+                        predecessors_idx,
+                        task_relations_idx,
+                        target_database,
+                        target_schema,
+                    )
+                    discovered_tasks.append(task_info)
+                    t_name = task_info["name"]
+                    t_state = task_info["state"]
+
+                    if pattern:
+                        if re.search(pattern, t_name):
+                            if str(t_state).lower() == desired_state:
+                                tasks_to_process.append(task_info)
+                    else:
                         if str(t_state).lower() == desired_state:
                             tasks_to_process.append(task_info)
-                else:
-                    if str(t_state).lower() == desired_state:
-                        tasks_to_process.append(task_info)
 
         if not tasks_to_process:
             click.echo(f"No {desired_state} tasks found to {action.lower()}.")

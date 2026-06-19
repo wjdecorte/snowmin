@@ -6,20 +6,12 @@ from typing import Optional
 from colorama import Fore, Style
 from snowmin.core.connection import ConnectionManager
 from snowmin.core.config import get_merged_connection_config
-
-
-def _parse_schema_spec(schema_spec: Optional[str], config_database: Optional[str]):
-    """Parse schema specification which can be 'schema' or 'database.schema'.
-    Returns (database, schema) tuple.
-    """
-    if not schema_spec:
-        return config_database, None
-
-    if "." in schema_spec:
-        parts = schema_spec.split(".", 1)
-        return parts[0], parts[1]
-    else:
-        return config_database, schema_spec
+from snowmin.operations.schema import (
+    build_schema_query_suffix,
+    location_label,
+    parse_schema_spec,
+    parse_schema_specs,
+)
 
 
 def _get_mode_color(mode: str) -> str:
@@ -33,30 +25,6 @@ def _get_mode_color(mode: str) -> str:
         return Fore.BLUE
     else:
         return Fore.WHITE
-
-
-def _build_schema_query_suffix(target_database, target_schema):
-    """Build the IN SCHEMA / IN DATABASE suffix for SHOW queries."""
-    if target_schema:
-        if target_database:
-            return f" IN SCHEMA {target_database}.{target_schema}"
-        else:
-            raise click.ClickException(
-                f"Cannot query schema '{target_schema}' without a database. "
-                f"Either set 'database' in your connection config or use --schema DATABASE.SCHEMA format."
-            )
-    elif target_database:
-        return f" IN DATABASE {target_database}"
-    return ""
-
-
-def _location_label(target_database, target_schema):
-    """Build a human-readable location label for echo messages."""
-    if target_schema:
-        return f" from {target_database}.{target_schema}"
-    elif target_database:
-        return f" from database {target_database}"
-    return ""
 
 
 def _derive_owner_role(database: str, schema: str) -> str:
@@ -146,61 +114,58 @@ def list_streams_command(
         )
         config_database = conn_config.get("database")
 
-        target_database, target_schema = _parse_schema_spec(
-            target_schema_spec, config_database
-        )
-
-        query = "SHOW STREAMS" + _build_schema_query_suffix(
-            target_database, target_schema
-        )
-
-        click.echo(
-            f"Fetching streams{_location_label(target_database, target_schema)}..."
-        )
-
-        cursor = ConnectionManager.execute(query, conn_config=conn_config)
-
-        # Helper to find column index case-insensitively
-        col_map = {c[0].upper(): i for i, c in enumerate(cursor.description)}
-        name_idx = col_map.get("NAME")
-        schema_idx = col_map.get("SCHEMA_NAME")
-        table_name_idx = col_map.get("TABLE_NAME")
-        mode_idx = col_map.get("MODE")
-        stale_idx = col_map.get("STALE")
-        type_idx = col_map.get("TYPE")
-
-        if name_idx is None:
-            click.echo(
-                f"{Fore.RED}Error: Could not find 'name' column in SHOW STREAMS result.{Style.RESET_ALL}",
-                err=True,
-            )
-            cursor.close()
-            return
-
-        rows = cursor.fetchall()
-        cursor.close()
-
-        if not rows:
-            click.echo("No streams found.")
-            return
-
         # Apply basic filters first
         filtered = []
-        for row in rows:
-            s_name = row[name_idx]
-            s_schema = row[schema_idx] if schema_idx is not None else "UNKNOWN"
-            s_table = row[table_name_idx] if table_name_idx is not None else "UNKNOWN"
-            s_mode = row[mode_idx] if mode_idx is not None else "UNKNOWN"
-            s_stale = row[stale_idx] if stale_idx is not None else "UNKNOWN"
-            s_type = row[type_idx] if type_idx is not None else "UNKNOWN"
+        for target_database, target_schema in parse_schema_specs(
+            target_schema_spec, config_database
+        ):
+            query = "SHOW STREAMS" + build_schema_query_suffix(
+                target_database, target_schema
+            )
 
-            if pattern and not re.search(pattern, s_name):
-                continue
+            click.echo(
+                f"Fetching streams{location_label(target_database, target_schema)}..."
+            )
 
-            filtered.append((s_schema, s_name, s_table, s_mode, s_stale, s_type))
+            cursor = ConnectionManager.execute(query, conn_config=conn_config)
+
+            # Helper to find column index case-insensitively
+            col_map = {c[0].upper(): i for i, c in enumerate(cursor.description)}
+            name_idx = col_map.get("NAME")
+            schema_idx = col_map.get("SCHEMA_NAME")
+            table_name_idx = col_map.get("TABLE_NAME")
+            mode_idx = col_map.get("MODE")
+            stale_idx = col_map.get("STALE")
+            type_idx = col_map.get("TYPE")
+
+            if name_idx is None:
+                click.echo(
+                    f"{Fore.RED}Error: Could not find 'name' column in SHOW STREAMS result.{Style.RESET_ALL}",
+                    err=True,
+                )
+                cursor.close()
+                return
+
+            rows = cursor.fetchall()
+            cursor.close()
+
+            for row in rows:
+                s_name = row[name_idx]
+                s_schema = row[schema_idx] if schema_idx is not None else "UNKNOWN"
+                s_table = (
+                    row[table_name_idx] if table_name_idx is not None else "UNKNOWN"
+                )
+                s_mode = row[mode_idx] if mode_idx is not None else "UNKNOWN"
+                s_stale = row[stale_idx] if stale_idx is not None else "UNKNOWN"
+                s_type = row[type_idx] if type_idx is not None else "UNKNOWN"
+
+                if pattern and not re.search(pattern, s_name):
+                    continue
+
+                filtered.append((s_schema, s_name, s_table, s_mode, s_stale, s_type))
 
         if not filtered:
-            click.echo("No streams matched the given filters.")
+            click.echo("No streams found.")
             return
 
         # Fetch has-data status for each stream
@@ -272,74 +237,85 @@ def create_stream_command(
         )
         config_database = conn_config.get("database")
 
-        target_database, target_schema = _parse_schema_spec(
+        current_owner_role = None
+        for target_database, target_schema in parse_schema_specs(
             target_schema_spec, config_database
-        )
-
-        # Build fully qualified stream name
-        if target_database and target_schema:
-            full_stream_name = f"{target_database}.{target_schema}.{stream_name}"
-        elif target_schema:
-            full_stream_name = f"{target_schema}.{stream_name}"
-        else:
-            full_stream_name = stream_name
-
-        # Build fully qualified source table name (if not already qualified)
-        if "." not in source_table:
+        ):
+            # Build fully qualified stream name
             if target_database and target_schema:
-                full_source_table = f"{target_database}.{target_schema}.{source_table}"
+                full_stream_name = f"{target_database}.{target_schema}.{stream_name}"
             elif target_schema:
-                full_source_table = f"{target_schema}.{source_table}"
+                full_stream_name = f"{target_schema}.{stream_name}"
+            else:
+                full_stream_name = stream_name
+
+            # Build fully qualified source table name (if not already qualified)
+            if "." not in source_table:
+                if target_database and target_schema:
+                    full_source_table = (
+                        f"{target_database}.{target_schema}.{source_table}"
+                    )
+                elif target_schema:
+                    full_source_table = f"{target_schema}.{source_table}"
+                else:
+                    full_source_table = source_table
             else:
                 full_source_table = source_table
-        else:
-            full_source_table = source_table
 
-        query = f"CREATE STREAM {full_stream_name} ON TABLE {full_source_table}"
+            query = f"CREATE STREAM {full_stream_name} ON TABLE {full_source_table}"
 
-        # Add mode clause
-        if mode:
-            mode_upper = mode.upper()
-            if mode_upper == "APPEND_ONLY":
-                query += " APPEND_ONLY = TRUE"
-            elif mode_upper == "INSERT_ONLY":
-                query += " INSERT_ONLY = TRUE"
-            elif mode_upper != "DEFAULT":
-                raise click.ClickException(
-                    f"Unknown stream mode: {mode}. Use DEFAULT, APPEND_ONLY, or INSERT_ONLY."
+            # Add mode clause
+            if mode:
+                mode_upper = mode.upper()
+                if mode_upper == "APPEND_ONLY":
+                    query += " APPEND_ONLY = TRUE"
+                elif mode_upper == "INSERT_ONLY":
+                    query += " INSERT_ONLY = TRUE"
+                elif mode_upper != "DEFAULT":
+                    raise click.ClickException(
+                        f"Unknown stream mode: {mode}. Use DEFAULT, APPEND_ONLY, or INSERT_ONLY."
+                    )
+
+            # Add point-in-time clause
+            if at:
+                query += f" AT (TIMESTAMP => '{at}'::TIMESTAMP_LTZ)"
+            elif before:
+                query += f" BEFORE (TIMESTAMP => '{before}'::TIMESTAMP_LTZ)"
+
+            stream_comment = comment
+            if not stream_comment and target_schema and source_table:
+                # Extract bare table name (strip any db.schema prefix)
+                bare_table = (
+                    source_table.rsplit(".", 1)[-1]
+                    if "." in source_table
+                    else source_table
                 )
+                stream_comment = (
+                    "Stream for tracking changes in "
+                    f"{target_database}.{target_schema}.{bare_table} table"
+                )
+            if stream_comment:
+                escaped = stream_comment.replace("'", "''")
+                query += f" COMMENT = '{escaped}'"
 
-        # Add point-in-time clause
-        if at:
-            query += f" AT (TIMESTAMP => '{at}'::TIMESTAMP_LTZ)"
-        elif before:
-            query += f" BEFORE (TIMESTAMP => '{before}'::TIMESTAMP_LTZ)"
+            # Switch to owner role before creating
+            if target_database and target_schema:
+                owner_role = _derive_owner_role(target_database, target_schema)
+                if owner_role != current_owner_role:
+                    use_role_query = f"USE ROLE {owner_role}"
+                    click.echo(f"Executing: {use_role_query}")
+                    cursor = ConnectionManager.execute(
+                        use_role_query, conn_config=conn_config
+                    )
+                    cursor.close()
+                    current_owner_role = owner_role
 
-        # Add comment (use default if none provided)
-        if not comment and target_schema and source_table:
-            # Extract bare table name (strip any db.schema prefix)
-            bare_table = (
-                source_table.rsplit(".", 1)[-1] if "." in source_table else source_table
-            )
-            comment = f"Stream for tracking changes in {target_database}.{target_schema}.{bare_table} table"
-        if comment:
-            escaped = comment.replace("'", "''")
-            query += f" COMMENT = '{escaped}'"
-
-        # Switch to owner role before creating
-        if target_database and target_schema:
-            owner_role = _derive_owner_role(target_database, target_schema)
-            use_role_query = f"USE ROLE {owner_role}"
-            click.echo(f"Executing: {use_role_query}")
-            cursor = ConnectionManager.execute(use_role_query, conn_config=conn_config)
+            click.echo(f"Executing: {query}")
+            cursor = ConnectionManager.execute(query, conn_config=conn_config)
             cursor.close()
-
-        click.echo(f"Executing: {query}")
-        cursor = ConnectionManager.execute(query, conn_config=conn_config)
-        cursor.close()
-        click.echo(
-            f"{Fore.GREEN}Successfully created stream: {full_stream_name}{Style.RESET_ALL}"
-        )
+            click.echo(
+                f"{Fore.GREEN}Successfully created stream: {full_stream_name}{Style.RESET_ALL}"
+            )
 
     except Exception as e:
         click.echo(f"{Fore.RED}Error: {e}{Style.RESET_ALL}", err=True)
@@ -361,31 +337,35 @@ def drop_stream_command(
         )
         config_database = conn_config.get("database")
 
-        target_database, target_schema = _parse_schema_spec(
+        streams_to_drop = []
+        for target_database, target_schema in parse_schema_specs(
             target_schema_spec, config_database
-        )
-
-        # Build fully qualified stream name
-        if target_database and target_schema:
-            full_stream_name = f"{target_database}.{target_schema}.{stream_name}"
-        elif target_schema:
-            full_stream_name = f"{target_schema}.{stream_name}"
-        else:
-            full_stream_name = stream_name
-
-        if not click.confirm(
-            f"Are you sure you want to drop stream '{full_stream_name}'?"
         ):
+            if target_database and target_schema:
+                full_stream_name = f"{target_database}.{target_schema}.{stream_name}"
+            elif target_schema:
+                full_stream_name = f"{target_schema}.{stream_name}"
+            else:
+                full_stream_name = stream_name
+            streams_to_drop.append(full_stream_name)
+
+        stream_label = (
+            streams_to_drop[0]
+            if len(streams_to_drop) == 1
+            else f"{len(streams_to_drop)} streams"
+        )
+        if not click.confirm(f"Are you sure you want to drop {stream_label}?"):
             click.echo("Operation cancelled.")
             return
 
-        query = f"DROP STREAM {full_stream_name}"
-        click.echo(f"Executing: {query}")
-        cursor = ConnectionManager.execute(query, conn_config=conn_config)
-        cursor.close()
-        click.echo(
-            f"{Fore.GREEN}Successfully dropped stream: {full_stream_name}{Style.RESET_ALL}"
-        )
+        for full_stream_name in streams_to_drop:
+            query = f"DROP STREAM {full_stream_name}"
+            click.echo(f"Executing: {query}")
+            cursor = ConnectionManager.execute(query, conn_config=conn_config)
+            cursor.close()
+            click.echo(
+                f"{Fore.GREEN}Successfully dropped stream: {full_stream_name}{Style.RESET_ALL}"
+            )
 
     except Exception as e:
         click.echo(f"{Fore.RED}Error: {e}{Style.RESET_ALL}", err=True)
@@ -418,49 +398,65 @@ def reset_stream_command(
         )
         config_database = conn_config.get("database")
 
-        target_database, target_schema = _parse_schema_spec(
-            target_schema_spec, config_database
-        )
-
         streams_to_process = []
 
         if stream_name:
-            streams_to_process.append((stream_name, target_database, target_schema))
-        else:
-            query = "SHOW STREAMS" + _build_schema_query_suffix(
-                target_database, target_schema
-            )
-            click.echo(
-                f"Fetching streams{_location_label(target_database, target_schema)}..."
-            )
-            cursor = ConnectionManager.execute(query, conn_config=conn_config)
-            col_map = {c[0].upper(): i for i, c in enumerate(cursor.description)}
-            name_idx = col_map.get("NAME")
-            database_idx = col_map.get("DATABASE_NAME")
-            schema_idx = col_map.get("SCHEMA_NAME")
-
-            if name_idx is None:
-                click.echo(
-                    f"{Fore.RED}Error: Could not find 'name' column in SHOW STREAMS result.{Style.RESET_ALL}",
-                    err=True,
+            if "." in stream_name:
+                target_database, target_schema = parse_schema_spec(
+                    target_schema_spec, config_database
                 )
+                streams_to_process.append((stream_name, target_database, target_schema))
+            else:
+                for target_database, target_schema in parse_schema_specs(
+                    target_schema_spec, config_database
+                ):
+                    streams_to_process.append(
+                        (stream_name, target_database, target_schema)
+                    )
+        else:
+            for target_database, target_schema in parse_schema_specs(
+                target_schema_spec, config_database
+            ):
+                query = "SHOW STREAMS" + build_schema_query_suffix(
+                    target_database, target_schema
+                )
+                click.echo(
+                    f"Fetching streams{location_label(target_database, target_schema)}..."
+                )
+                cursor = ConnectionManager.execute(query, conn_config=conn_config)
+                col_map = {c[0].upper(): i for i, c in enumerate(cursor.description)}
+                name_idx = col_map.get("NAME")
+                database_idx = col_map.get("DATABASE_NAME")
+                schema_idx = col_map.get("SCHEMA_NAME")
+
+                if name_idx is None:
+                    click.echo(
+                        f"{Fore.RED}Error: Could not find 'name' column in SHOW STREAMS result.{Style.RESET_ALL}",
+                        err=True,
+                    )
+                    cursor.close()
+                    return
+
+                rows = cursor.fetchall()
                 cursor.close()
-                return
 
-            rows = cursor.fetchall()
-            cursor.close()
-
-            for row in rows:
-                s_name = row[name_idx]
-                s_database = row[database_idx] if database_idx is not None else None
-                s_schema = row[schema_idx] if schema_idx is not None else None
-                streams_to_process.append((s_name, s_database, s_schema))
+                for row in rows:
+                    s_name = row[name_idx]
+                    s_database = (
+                        row[database_idx]
+                        if database_idx is not None
+                        else target_database
+                    )
+                    s_schema = (
+                        row[schema_idx] if schema_idx is not None else target_schema
+                    )
+                    streams_to_process.append((s_name, s_database, s_schema))
 
         if not streams_to_process:
             click.echo("No streams found to reset.")
             return
 
-        if all_flag:
+        if all_flag or len(streams_to_process) > 1:
             click.echo(f"\nFound {len(streams_to_process)} stream(s) to reset:")
             for s_name, s_database, s_schema in streams_to_process:
                 if s_database and s_schema:
@@ -491,18 +487,22 @@ def reset_stream_command(
                 click.echo("Operation cancelled.")
                 return
 
-        # Switch to owner role before drop/recreate
-        if target_database and target_schema:
-            owner_role = _derive_owner_role(target_database, target_schema)
-            use_role_query = f"USE ROLE {owner_role}"
-            click.echo(f"Executing: {use_role_query}")
-            cursor = ConnectionManager.execute(use_role_query, conn_config=conn_config)
-            cursor.close()
-
+        current_owner_role = None
         for s_name, s_database, s_schema in streams_to_process:
             try:
-                stream_database = s_database or target_database
-                stream_schema = s_schema or target_schema
+                stream_database = s_database
+                stream_schema = s_schema
+
+                if stream_database and stream_schema:
+                    owner_role = _derive_owner_role(stream_database, stream_schema)
+                    if owner_role != current_owner_role:
+                        use_role_query = f"USE ROLE {owner_role}"
+                        click.echo(f"Executing: {use_role_query}")
+                        cursor = ConnectionManager.execute(
+                            use_role_query, conn_config=conn_config
+                        )
+                        cursor.close()
+                        current_owner_role = owner_role
 
                 if stream_database and stream_schema:
                     full_stream_name = f"{stream_database}.{stream_schema}.{s_name}"
@@ -529,7 +529,7 @@ def reset_stream_command(
                 # 2. Extract existing comment before dropping
                 existing_comment = None
                 show_query = f"SHOW STREAMS LIKE '{s_name}'"
-                show_query += _build_schema_query_suffix(stream_database, stream_schema)
+                show_query += build_schema_query_suffix(stream_database, stream_schema)
                 cursor = ConnectionManager.execute(show_query, conn_config=conn_config)
                 col_map = {c[0].upper(): i for i, c in enumerate(cursor.description)}
                 comment_idx = col_map.get("COMMENT")

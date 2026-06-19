@@ -7,20 +7,11 @@ from typing import Optional
 from colorama import Fore, Style
 from snowmin.core.connection import ConnectionManager
 from snowmin.core.config import get_merged_connection_config
-
-
-def _parse_schema_spec(schema_spec: Optional[str], config_database: Optional[str]):
-    """Parse schema specification which can be 'schema' or 'database.schema'.
-    Returns (database, schema) tuple.
-    """
-    if not schema_spec:
-        return config_database, None
-
-    if "." in schema_spec:
-        parts = schema_spec.split(".", 1)
-        return parts[0], parts[1]
-    else:
-        return config_database, schema_spec
+from snowmin.operations.schema import (
+    build_schema_query_suffix,
+    location_label,
+    parse_schema_specs,
+)
 
 
 def _get_status_color(status: str) -> str:
@@ -107,64 +98,52 @@ def list_pipes_command(
         )
         config_database = conn_config.get("database")
 
-        target_database, target_schema = _parse_schema_spec(
-            target_schema_spec, config_database
-        )
-
-        query = "SHOW PIPES"
-        if target_schema:
-            if target_database:
-                query += f" IN SCHEMA {target_database}.{target_schema}"
-            else:
-                raise click.ClickException(
-                    f"Cannot query schema '{target_schema}' without a database. "
-                    f"Either set 'database' in your connection config or use --schema DATABASE.SCHEMA format."
-                )
-        elif target_database:
-            # Only database specified, no schema
-            query += f" IN DATABASE {target_database}"
-
-        click.echo(
-            f"Fetching pipes{f' from {target_database}.{target_schema}' if target_schema else f' from database {target_database}' if target_database else ''}..."
-        )
-
-        cursor = ConnectionManager.execute(query, conn_config=conn_config)
-
-        # Helper to find column index case-insensitively
-        col_map = {c[0].upper(): i for i, c in enumerate(cursor.description)}
-        name_idx = col_map.get("NAME")
-        database_idx = col_map.get("DATABASE_NAME")
-        schema_idx = col_map.get("SCHEMA_NAME")
-
-        if name_idx is None:
-            click.echo(
-                f"{Fore.RED}Error: Could not find 'name' column in SHOW PIPES result.{Style.RESET_ALL}",
-                err=True,
-            )
-            cursor.close()
-            return
-
-        rows = cursor.fetchall()
-        cursor.close()
-
-        if not rows:
-            click.echo("No pipes found.")
-            return
-
         # Pre-filter pipes by pattern to minimize SYSTEM$PIPE_STATUS calls
         pipes_to_check = []
-        for row in rows:
-            p_name = row[name_idx]
-            p_database = row[database_idx] if database_idx is not None else None
-            p_schema = row[schema_idx] if schema_idx is not None else None
+        for target_database, target_schema in parse_schema_specs(
+            target_schema_spec, config_database
+        ):
+            query = "SHOW PIPES" + build_schema_query_suffix(
+                target_database, target_schema
+            )
 
-            if pattern and not re.search(pattern, p_name):
-                continue
+            click.echo(
+                f"Fetching pipes{location_label(target_database, target_schema)}..."
+            )
 
-            pipes_to_check.append((p_name, p_database, p_schema))
+            cursor = ConnectionManager.execute(query, conn_config=conn_config)
+
+            # Helper to find column index case-insensitively
+            col_map = {c[0].upper(): i for i, c in enumerate(cursor.description)}
+            name_idx = col_map.get("NAME")
+            database_idx = col_map.get("DATABASE_NAME")
+            schema_idx = col_map.get("SCHEMA_NAME")
+
+            if name_idx is None:
+                click.echo(
+                    f"{Fore.RED}Error: Could not find 'name' column in SHOW PIPES result.{Style.RESET_ALL}",
+                    err=True,
+                )
+                cursor.close()
+                return
+
+            rows = cursor.fetchall()
+            cursor.close()
+
+            for row in rows:
+                p_name = row[name_idx]
+                p_database = (
+                    row[database_idx] if database_idx is not None else target_database
+                )
+                p_schema = row[schema_idx] if schema_idx is not None else target_schema
+
+                if pattern and not re.search(pattern, p_name):
+                    continue
+
+                pipes_to_check.append((p_name, p_database, p_schema))
 
         if not pipes_to_check:
-            click.echo("No pipes found matching pattern.")
+            click.echo("No pipes found.")
             return
 
         click.echo(f"Fetching detailed status for {len(pipes_to_check)} pipe(s)...")
@@ -219,9 +198,7 @@ def _process_pipes(
         )
         config_database = conn_config.get("database")
 
-        target_database, target_schema = _parse_schema_spec(
-            target_schema_spec, config_database
-        )
+        target_locations = parse_schema_specs(target_schema_spec, config_database)
 
         pipes_to_process = []
 
@@ -237,93 +214,96 @@ def _process_pipes(
             p_n = pipe_name
             p_d = None
             p_s = None
+            pipe_locations = target_locations
             if "." in p_n:
                 parts = p_n.split(".")
                 if len(parts) == 3:
                     p_d, p_s, p_n = parts
+                    pipe_locations = [(p_d, p_s)]
                 elif len(parts) == 2:
                     p_s, p_n = parts
+                    pipe_locations = [(config_database, p_s)]
 
-            # If status filter is applied, we MUST fetch status first.
-            current_state = "UNKNOWN"
-            if status:
-                status_map = _fetch_pipe_statuses(
-                    conn_config, [(p_n, p_d or target_database, p_s or target_schema)]
-                )
-                current_state = status_map.get(p_n, "UNKNOWN")
-
-                if current_state.upper() != status.upper():
-                    click.echo(
-                        f"Pipe {pipe_name} has status {current_state}, skipping (requested {status})"
+            for pipe_database, pipe_schema in pipe_locations:
+                # If status filter is applied, we MUST fetch status first.
+                current_state = "UNKNOWN"
+                if status:
+                    status_map = _fetch_pipe_statuses(
+                        conn_config, [(p_n, pipe_database, pipe_schema)]
                     )
-                    return
+                    current_state = status_map.get(p_n, "UNKNOWN")
 
-            pipes_to_process.append((p_n, current_state, p_d, p_s))
+                    if current_state.upper() != status.upper():
+                        click.echo(
+                            f"Pipe {pipe_name} has status {current_state}, skipping (requested {status})"
+                        )
+                        continue
+
+                pipes_to_process.append(
+                    (p_n, current_state, pipe_database, pipe_schema)
+                )
 
         elif pattern:
             # Pattern-based filtering
-            query = "SHOW PIPES"
-            if target_schema:
-                if target_database:
-                    query += f" IN SCHEMA {target_database}.{target_schema}"
-                else:
-                    raise click.ClickException(
-                        f"Cannot query schema '{target_schema}' without a database. "
-                        f"Either set 'database' in your connection config or use --schema DATABASE.SCHEMA format."
-                    )
-            elif target_database:
-                # Only database specified, no schema
-                query += f" IN DATABASE {target_database}"
-
-            click.echo(
-                f"Fetching pipes{f' from {target_database}.{target_schema}' if target_schema else f' from database {target_database}' if target_database else ''}..."
-            )
-            cursor = ConnectionManager.execute(query, conn_config=conn_config)
-
-            # Helper to find column index case-insensitively
-            col_map = {c[0].upper(): i for i, c in enumerate(cursor.description)}
-            name_idx = col_map.get("NAME")
-            database_idx = col_map.get("DATABASE_NAME")
-            schema_idx = col_map.get("SCHEMA_NAME")
-
-            if name_idx is None:
-                click.echo(
-                    f"{Fore.RED}Error: Could not find 'name' column in SHOW PIPES result.{Style.RESET_ALL}",
-                    err=True,
+            for target_database, target_schema in target_locations:
+                query = "SHOW PIPES" + build_schema_query_suffix(
+                    target_database, target_schema
                 )
+
+                click.echo(
+                    f"Fetching pipes{location_label(target_database, target_schema)}..."
+                )
+                cursor = ConnectionManager.execute(query, conn_config=conn_config)
+
+                # Helper to find column index case-insensitively
+                col_map = {c[0].upper(): i for i, c in enumerate(cursor.description)}
+                name_idx = col_map.get("NAME")
+                database_idx = col_map.get("DATABASE_NAME")
+                schema_idx = col_map.get("SCHEMA_NAME")
+
+                if name_idx is None:
+                    click.echo(
+                        f"{Fore.RED}Error: Could not find 'name' column in SHOW PIPES result.{Style.RESET_ALL}",
+                        err=True,
+                    )
+                    cursor.close()
+                    return
+
+                rows = cursor.fetchall()
                 cursor.close()
-                return
 
-            rows = cursor.fetchall()
-            cursor.close()
+                # First filter by pattern
+                candidates = []
+                for row in rows:
+                    p_name = row[name_idx]
+                    p_database = (
+                        row[database_idx]
+                        if database_idx is not None
+                        else target_database
+                    )
+                    p_schema = (
+                        row[schema_idx] if schema_idx is not None else target_schema
+                    )
 
-            # First filter by pattern
-            candidates = []
-            for row in rows:
-                p_name = row[name_idx]
-                p_database = row[database_idx] if database_idx is not None else None
-                p_schema = row[schema_idx] if schema_idx is not None else None
+                    if not re.search(pattern, p_name):
+                        continue
+                    candidates.append((p_name, p_database, p_schema))
 
-                if not re.search(pattern, p_name):
-                    continue
-                candidates.append((p_name, p_database, p_schema))
-
-            if not candidates:
-                click.echo("No pipes found matching pattern.")
-                return
-
-            # Now fetch statuses for candidates
-            click.echo(f"Fetching statuses for {len(candidates)} pipes...")
-            status_map = _fetch_pipe_statuses(conn_config, candidates)
-
-            for p_name, p_database, p_schema in candidates:
-                p_state = status_map.get(p_name, "UNKNOWN")
-
-                # Apply status filter (case-insensitive)
-                if status and p_state.upper() != status.upper():
+                if not candidates:
                     continue
 
-                pipes_to_process.append((p_name, p_state, p_database, p_schema))
+                # Now fetch statuses for candidates
+                click.echo(f"Fetching statuses for {len(candidates)} pipes...")
+                status_map = _fetch_pipe_statuses(conn_config, candidates)
+
+                for p_name, p_database, p_schema in candidates:
+                    p_state = status_map.get(p_name, "UNKNOWN")
+
+                    # Apply status filter (case-insensitive)
+                    if status and p_state.upper() != status.upper():
+                        continue
+
+                    pipes_to_process.append((p_name, p_state, p_database, p_schema))
 
         if not pipes_to_process:
             click.echo("No pipes found to process.")
@@ -363,8 +343,8 @@ def _process_pipes(
 
             try:
                 # Build fully qualified pipe name
-                pipe_schema = p_schema or target_schema
-                pipe_database = p_database or target_database
+                pipe_schema = p_schema
+                pipe_database = p_database
 
                 if pipe_database and pipe_schema:
                     full_pipe_name = f"{pipe_database}.{pipe_schema}.{p_name}"
@@ -459,9 +439,7 @@ def drop_recreate_pipe_command(
         )
         config_database = conn_config.get("database")
 
-        target_database, target_schema = _parse_schema_spec(
-            target_schema_spec, config_database
-        )
+        target_locations = parse_schema_specs(target_schema_spec, config_database)
 
         pipes_to_process = []
 
@@ -472,105 +450,108 @@ def drop_recreate_pipe_command(
             p_n = pipe_name
             p_d = None
             p_s = None
+            pipe_locations = target_locations
             if "." in p_n:
                 parts = p_n.split(".")
                 if len(parts) == 3:
                     p_d, p_s, p_n = parts
+                    pipe_locations = [(p_d, p_s)]
                 elif len(parts) == 2:
                     p_s, p_n = parts
+                    pipe_locations = [(config_database, p_s)]
 
-            current_state = "UNKNOWN"
-            if status and not skip_status:
-                status_map = _fetch_pipe_statuses(
-                    conn_config, [(p_n, p_d or target_database, p_s or target_schema)]
-                )
-                current_state = status_map.get(p_n, "UNKNOWN")
-
-                if current_state.upper() != status.upper():
-                    click.echo(
-                        f"Pipe {pipe_name} has status {current_state}, skipping (requested {status})"
+            for pipe_database, pipe_schema in pipe_locations:
+                current_state = "UNKNOWN"
+                if status and not skip_status:
+                    status_map = _fetch_pipe_statuses(
+                        conn_config, [(p_n, pipe_database, pipe_schema)]
                     )
-                    return
-            elif not skip_status:
-                # Fetch status just for display if not skipping
-                status_map = _fetch_pipe_statuses(
-                    conn_config, [(p_n, p_d or target_database, p_s or target_schema)]
-                )
-                current_state = status_map.get(p_n, "UNKNOWN")
+                    current_state = status_map.get(p_n, "UNKNOWN")
 
-            pipes_to_process.append((p_n, current_state, p_d, p_s))
+                    if current_state.upper() != status.upper():
+                        click.echo(
+                            f"Pipe {pipe_name} has status {current_state}, skipping (requested {status})"
+                        )
+                        continue
+                elif not skip_status:
+                    # Fetch status just for display if not skipping
+                    status_map = _fetch_pipe_statuses(
+                        conn_config, [(p_n, pipe_database, pipe_schema)]
+                    )
+                    current_state = status_map.get(p_n, "UNKNOWN")
+
+                pipes_to_process.append(
+                    (p_n, current_state, pipe_database, pipe_schema)
+                )
 
         elif pattern or all_flag:
             # Pattern-based or all pipes
-            query = "SHOW PIPES"
-            if target_schema:
-                if target_database:
-                    query += f" IN SCHEMA {target_database}.{target_schema}"
-                else:
-                    raise click.ClickException(
-                        f"Cannot query schema '{target_schema}' without a database. "
-                        f"Either set 'database' in your connection config or use --schema DATABASE.SCHEMA format."
-                    )
-            elif target_database:
-                # Only database specified, no schema
-                query += f" IN DATABASE {target_database}"
-
-            click.echo(
-                f"Fetching pipes{f' from {target_database}.{target_schema}' if target_schema else f' from database {target_database}' if target_database else ''}..."
-            )
-            cursor = ConnectionManager.execute(query, conn_config=conn_config)
-
-            col_map = {c[0].upper(): i for i, c in enumerate(cursor.description)}
-            name_idx = col_map.get("NAME")
-            database_idx = col_map.get("DATABASE_NAME")
-            schema_idx = col_map.get("SCHEMA_NAME")
-
-            if name_idx is None:
-                click.echo(
-                    f"{Fore.RED}Error: Could not find 'name' column in SHOW PIPES result.{Style.RESET_ALL}",
-                    err=True,
+            for target_database, target_schema in target_locations:
+                query = "SHOW PIPES" + build_schema_query_suffix(
+                    target_database, target_schema
                 )
+
+                click.echo(
+                    f"Fetching pipes{location_label(target_database, target_schema)}..."
+                )
+                cursor = ConnectionManager.execute(query, conn_config=conn_config)
+
+                col_map = {c[0].upper(): i for i, c in enumerate(cursor.description)}
+                name_idx = col_map.get("NAME")
+                database_idx = col_map.get("DATABASE_NAME")
+                schema_idx = col_map.get("SCHEMA_NAME")
+
+                if name_idx is None:
+                    click.echo(
+                        f"{Fore.RED}Error: Could not find 'name' column in SHOW PIPES result.{Style.RESET_ALL}",
+                        err=True,
+                    )
+                    cursor.close()
+                    return
+
+                rows = cursor.fetchall()
                 cursor.close()
-                return
 
-            rows = cursor.fetchall()
-            cursor.close()
+                # First match filtering
+                candidates = []
+                for row in rows:
+                    p_name = row[name_idx]
+                    p_database = (
+                        row[database_idx]
+                        if database_idx is not None
+                        else target_database
+                    )
+                    p_schema = (
+                        row[schema_idx] if schema_idx is not None else target_schema
+                    )
 
-            # First match filtering
-            candidates = []
-            for row in rows:
-                p_name = row[name_idx]
-                p_database = row[database_idx] if database_idx is not None else None
-                p_schema = row[schema_idx] if schema_idx is not None else None
+                    # Apply pattern filter if provided
+                    if pattern and not re.search(pattern, p_name):
+                        continue
 
-                # Apply pattern filter if provided
-                if pattern and not re.search(pattern, p_name):
+                    candidates.append((p_name, p_database, p_schema))
+
+                if not candidates:
                     continue
 
-                candidates.append((p_name, p_database, p_schema))
+                # Fetch detailed statuses unless skipped
+                status_map = {}
+                if not skip_status:
+                    click.echo(f"Fetching statuses for {len(candidates)} pipes...")
+                    status_map = _fetch_pipe_statuses(conn_config, candidates)
 
-            if not candidates:
-                click.echo("No pipes found matching pattern.")
-                return
+                for p_name, p_database, p_schema in candidates:
+                    p_state = status_map.get(p_name, "UNKNOWN")
 
-            # Fetch detailed statuses unless skipped
-            status_map = {}
-            if not skip_status:
-                click.echo(f"Fetching statuses for {len(candidates)} pipes...")
-                status_map = _fetch_pipe_statuses(conn_config, candidates)
+                    # Apply status filter (case-insensitive)
+                    # Note: if skip_status is True, p_state is UNKNOWN.
+                    # If user filters by status AND uses --skip-status, effectively no pipes will match
+                    # unless they filter for UNKNOWN (which is unlikely what they want).
+                    # We should probably warn or error if both are used, but for now we follow logic.
+                    if status and p_state.upper() != status.upper():
+                        continue
 
-            for p_name, p_database, p_schema in candidates:
-                p_state = status_map.get(p_name, "UNKNOWN")
-
-                # Apply status filter (case-insensitive)
-                # Note: if skip_status is True, p_state is UNKNOWN.
-                # If user filters by status AND uses --skip-status, effectively no pipes will match
-                # unless they filter for UNKNOWN (which is unlikely what they want).
-                # We should probably warn or error if both are used, but for now we follow logic.
-                if status and p_state.upper() != status.upper():
-                    continue
-
-                pipes_to_process.append((p_name, p_state, p_database, p_schema))
+                    pipes_to_process.append((p_name, p_state, p_database, p_schema))
 
         if not pipes_to_process:
             click.echo("No pipes found to process.")
@@ -625,8 +606,8 @@ def drop_recreate_pipe_command(
 
             try:
                 # Build fully qualified pipe name
-                pipe_schema = p_schema or target_schema
-                pipe_database = p_database or target_database
+                pipe_schema = p_schema
+                pipe_database = p_database
 
                 if pipe_database and pipe_schema:
                     full_pipe_name = f"{pipe_database}.{pipe_schema}.{p_name}"

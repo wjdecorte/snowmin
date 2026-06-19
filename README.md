@@ -146,12 +146,13 @@ These commands use the same connection configuration and global overrides as
 `plan` and `apply`.
 
 Most commands accept either the schema from your active configuration or a
-`--schema` option. Schema values can be passed as either `SCHEMA` or
-`DATABASE.SCHEMA`.
+`--schema` option. Schema values can be passed as `SCHEMA`, `DATABASE.SCHEMA`,
+or a comma-separated list such as `SILVER,GOLD`.
 
 ```bash
 uv run snowmin --connection prod --database ANALYTICS --schema MART streams list
 uv run snowmin tasks list --schema ANALYTICS.MART
+uv run snowmin tasks list --schema SILVER,GOLD
 ```
 
 ### Tasks
@@ -176,7 +177,7 @@ Suspend or resume multiple tasks with confirmation:
 
 ```bash
 uv run snowmin tasks suspend --all --schema ANALYTICS.MART
-uv run snowmin tasks resume --pattern '^LOAD_' --schema ANALYTICS.MART
+uv run snowmin tasks resume --pattern '^LOAD_' --schema SILVER,GOLD
 ```
 
 Bulk task operations print the matched tasks and ask for confirmation before
@@ -194,6 +195,7 @@ List streams:
 ```bash
 uv run snowmin streams list
 uv run snowmin streams list --schema ANALYTICS.MART
+uv run snowmin streams list --schema SILVER,GOLD
 uv run snowmin streams list --pattern '_STREAM$'
 uv run snowmin streams list --has-data
 uv run snowmin streams list --no-data
@@ -221,7 +223,7 @@ Drop or reset a stream:
 
 ```bash
 uv run snowmin streams drop CUSTOMER_STREAM --schema ANALYTICS.MART
-uv run snowmin streams reset CUSTOMER_STREAM --schema ANALYTICS.MART
+uv run snowmin streams reset CUSTOMER_STREAM --schema SILVER,GOLD
 uv run snowmin streams reset --all --schema ANALYTICS.MART
 uv run snowmin streams reset CUSTOMER_STREAM --at '2026-01-01 00:00:00'
 ```
@@ -242,6 +244,7 @@ List pipes:
 ```bash
 uv run snowmin pipes list
 uv run snowmin pipes list --schema ANALYTICS.MART
+uv run snowmin pipes list --schema SILVER,GOLD
 uv run snowmin pipes list --pattern '^LOAD_'
 uv run snowmin pipes list --status RUNNING
 ```
@@ -258,7 +261,7 @@ Process multiple pipes by regex pattern, optionally filtered by current status:
 
 ```bash
 uv run snowmin pipes refresh --pattern '^LOAD_' --status RUNNING
-uv run snowmin pipes pause --pattern '^LOAD_' --schema ANALYTICS.MART
+uv run snowmin pipes pause --pattern '^LOAD_' --schema SILVER,GOLD
 uv run snowmin pipes resume --pattern '^LOAD_' --status PAUSED
 ```
 

@@ -64,10 +64,9 @@ class ConnectionManager:
                 conn_args["warehouse"] = conn_config["warehouse"]
             if conn_config.get("database"):
                 conn_args["database"] = conn_config["database"]
-            if conn_config.get("schema") or conn_config.get("schema_name"):
-                conn_args["schema"] = conn_config.get("schema") or conn_config.get(
-                    "schema_name"
-                )
+            schema = conn_config.get("schema") or conn_config.get("schema_name")
+            if schema and "," not in schema:
+                conn_args["schema"] = schema
 
             # Authentication: priority is private_key > password > externalbrowser
             private_key_file = conn_config.get("private_key_file")

@@ -12,7 +12,7 @@ colorama.init()
     "--connection", "-c", help="Connection profile name from connections.toml"
 )
 @click.option("--database", help="Override database")
-@click.option("--schema", help="Override schema")
+@click.option("--schema", help="Override schema or comma-separated schemas")
 @click.option("--warehouse", help="Override warehouse")
 @click.option("--role", help="Override role")
 @click.pass_context
@@ -215,7 +215,7 @@ def tasks(ctx):
 
 @tasks.command("list")
 @click.option("--pattern", help="Filter tasks by regex pattern")
-@click.option("--schema", help="Schema to look for tasks in")
+@click.option("--schema", help="Schema(s) to look for tasks in")
 @click.option("--status", help="Filter by status (started, suspended)")
 @click.pass_context
 def list_tasks(ctx, pattern, schema, status):
@@ -229,7 +229,7 @@ def list_tasks(ctx, pattern, schema, status):
 @click.argument("task_name", required=False)
 @click.option("--all", is_flag=True, help="Suspend all tasks in schema")
 @click.option("--pattern", help="Suspend tasks matching regex pattern")
-@click.option("--schema", help="Schema to look for tasks in")
+@click.option("--schema", help="Schema(s) to look for tasks in")
 @click.pass_context
 def suspend_task(ctx, task_name, all, pattern, schema):
     """Suspend a task or multiple tasks"""
@@ -242,7 +242,7 @@ def suspend_task(ctx, task_name, all, pattern, schema):
 @click.argument("task_name", required=False)
 @click.option("--all", is_flag=True, help="Resume all tasks in schema")
 @click.option("--pattern", help="Resume tasks matching regex pattern")
-@click.option("--schema", help="Schema to look for tasks in")
+@click.option("--schema", help="Schema(s) to look for tasks in")
 @click.pass_context
 def resume_task(ctx, task_name, all, pattern, schema):
     """Resume a task or multiple tasks"""
@@ -277,7 +277,7 @@ def streams(ctx):
 
 @streams.command("list")
 @click.option("--pattern", help="Filter streams by regex pattern")
-@click.option("--schema", help="Schema to query (DATABASE.SCHEMA or SCHEMA)")
+@click.option("--schema", help="Schema(s) to query (DATABASE.SCHEMA or SCHEMA)")
 @click.option(
     "--has-data/--no-data",
     default=None,
@@ -294,7 +294,7 @@ def list_streams(ctx, pattern, schema, has_data):
 @streams.command("create")
 @click.argument("stream_name")
 @click.argument("source_table")
-@click.option("--schema", help="Schema to create the stream in")
+@click.option("--schema", help="Schema(s) to create the stream in")
 @click.option(
     "--mode",
     type=click.Choice(["DEFAULT", "APPEND_ONLY", "INSERT_ONLY"], case_sensitive=False),
@@ -317,7 +317,7 @@ def create_stream(ctx, stream_name, source_table, schema, mode, before, at, comm
 
 @streams.command("drop")
 @click.argument("stream_name")
-@click.option("--schema", help="Schema the stream belongs to")
+@click.option("--schema", help="Schema(s) the stream belongs to")
 @click.pass_context
 def drop_stream(ctx, stream_name, schema):
     """Drop a stream"""
@@ -329,7 +329,7 @@ def drop_stream(ctx, stream_name, schema):
 @streams.command("reset")
 @click.argument("stream_name", required=False)
 @click.option("--all", "all_streams", is_flag=True, help="Reset all streams in schema")
-@click.option("--schema", help="Schema the stream belongs to")
+@click.option("--schema", help="Schema(s) the stream belongs to")
 @click.option("--at", help="Recreate stream AT timestamp (e.g. '2024-01-01 00:00:00')")
 @click.pass_context
 def reset_stream(ctx, stream_name, all_streams, schema, at):
@@ -348,7 +348,7 @@ def pipes(ctx):
 
 @pipes.command("list")
 @click.option("--pattern", help="Filter pipes by regex pattern")
-@click.option("--schema", help="Schema to query (DATABASE.SCHEMA or SCHEMA)")
+@click.option("--schema", help="Schema(s) to query (DATABASE.SCHEMA or SCHEMA)")
 @click.option("--status", help="Filter by status (RUNNING, PAUSED, STALLED)")
 @click.pass_context
 def list_pipes(ctx, pattern, schema, status):
@@ -361,7 +361,7 @@ def list_pipes(ctx, pattern, schema, status):
 @pipes.command("refresh")
 @click.argument("pipe_name", required=False)
 @click.option("--pattern", help="Refresh pipes matching regex pattern")
-@click.option("--schema", help="Schema to query")
+@click.option("--schema", help="Schema(s) to query")
 @click.option("--status", help="Filter by status before refreshing")
 @click.pass_context
 def refresh_pipe(ctx, pipe_name, pattern, schema, status):
@@ -374,7 +374,7 @@ def refresh_pipe(ctx, pipe_name, pattern, schema, status):
 @pipes.command("pause")
 @click.argument("pipe_name", required=False)
 @click.option("--pattern", help="Pause pipes matching regex pattern")
-@click.option("--schema", help="Schema to query")
+@click.option("--schema", help="Schema(s) to query")
 @click.option("--status", help="Filter by status before pausing")
 @click.pass_context
 def pause_pipe(ctx, pipe_name, pattern, schema, status):
@@ -387,7 +387,7 @@ def pause_pipe(ctx, pipe_name, pattern, schema, status):
 @pipes.command("resume")
 @click.argument("pipe_name", required=False)
 @click.option("--pattern", help="Resume pipes matching regex pattern")
-@click.option("--schema", help="Schema to query")
+@click.option("--schema", help="Schema(s) to query")
 @click.option("--status", help="Filter by status before resuming")
 @click.pass_context
 def resume_pipe(ctx, pipe_name, pattern, schema, status):
@@ -401,7 +401,7 @@ def resume_pipe(ctx, pipe_name, pattern, schema, status):
 @click.argument("pipe_name", required=False)
 @click.option("--all", is_flag=True, help="Process all pipes")
 @click.option("--pattern", help="Drop-recreate pipes matching regex pattern")
-@click.option("--schema", help="Schema to query")
+@click.option("--schema", help="Schema(s) to query")
 @click.option("--status", help="Filter by status before drop-recreate")
 @click.option(
     "--skip-status",
